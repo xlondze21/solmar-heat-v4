@@ -1,79 +1,129 @@
-// The screenshot scenes behind ?shot=start|play|end. Each one plays the real rules forward from a
-// fresh world for a fixed number of steps, steered by a simple autopilot (look ahead each way the
-// paddle could move, keep clear of blocks, chase the lowest coin when that is safe), so the frame
-// is what a short game really looks like and the same seed always gives the same frame.
-import { FIELD, PLAYER, STEP } from './config.js';
-import { EVENT_OVER, KIND_BLOCK } from './world.js';
-import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
+// The screenshot scenes behind ?shot=cover|drive|mission|chase. Each one stages
+// the real game — the same world, the same rules, the same seeded traffic —
+// then drives it forward a few seconds with a simple autopilot, so the frame
+// is what a short game really looks like and the same seed always gives the
+// same frame. The cover shows several systems at once: a police helicopter,
+// three wanted stars, the minimap and a mission objective.
+import { STEP } from './config.js';
+import { SCREEN_PLAY } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 26;
-const END_LIMIT_SECONDS = 600;
-/**
- * How far ahead, in seconds, the autopilot checks each way it could move: the play scene's pilot
- * looks well ahead and keeps all its lives; the end scene's looks only a moment ahead, so it is
- * caught out once the blocks speed up, as a hurried player is.
- */
-const HORIZON_PLAY = 0.7;
-const HORIZON_END = 0.25;
-const SAMPLE = 1 / 30;
-const DIRECTIONS = [0, -1, 1];
-/** Extra room, each side, it keeps between the paddle and a block. */
-const MARGIN = 10;
-
-/** Seconds until moving in `direction` (-1, 0, 1) runs the paddle into a block; Infinity when it never does. */
-function timeToHit(state, direction, horizon) {
-  const player = state.player;
-  for (let t = SAMPLE; t <= horizon; t += SAMPLE) {
-    const x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * t));
-    for (let index = 0; index < state.items.length; index += 1) {
-      const item = state.items[index];
-      if (!item.active || item.kind !== KIND_BLOCK) continue;
-      const y = item.y + item.speed * t;
-      if (y + item.height > player.y && y < player.y + player.height && item.x < x + player.width + MARGIN && item.x + item.width > x - MARGIN) return t;
-    }
-  }
-  return Infinity;
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
 }
 
-/** Of the safe ways to move, the one toward the lowest coin (or the centre); else the one that is hit last. */
-function autopilot(state, horizon) {
-  const player = state.player;
-  let coin = null;
-  for (let index = 0; index < state.items.length; index += 1) {
-    const item = state.items[index];
-    if (item.active && item.kind !== KIND_BLOCK && (coin === null || item.y > coin.y)) coin = item;
-  }
-  const target = coin === null ? FIELD.width / 2 : coin.x + coin.width / 2;
-  const centre = player.x + player.width / 2;
-  const wanted = target > centre + 8 ? 1 : target < centre - 8 ? -1 : 0;
-  let best = wanted;
-  let bestTime = timeToHit(state, wanted, horizon);
-  for (let index = 0; index < DIRECTIONS.length && bestTime !== Infinity; index += 1) {
-    const time = timeToHit(state, DIRECTIONS[index], horizon);
-    if (time > bestTime) {
-      bestTime = time;
-      best = DIRECTIONS[index];
-    }
-  }
-  return best;
+function angleDiff(a, b) {
+  let d = a - b;
+  while (d > Math.PI) d -= Math.PI * 2;
+  while (d < -Math.PI) d += Math.PI * 2;
+  return d;
 }
 
-/**
- * Set `world` to the named scene (start, play or end; any other name is start) and return the
- * screen to draw over it and the best score to show.
- */
-export function stageShot(name, world) {
-  world.reset();
-  if (name !== 'play' && name !== 'end') {
-    for (let index = 0; index < START_SECONDS / STEP; index += 1) world.step(STEP, 0, true);
-    return { screen: SCREEN_TITLE, best: 0 };
+// Steer the player's car toward a point; throttle forward.
+function driveToward(game, tx, ty) {
+  const car = game.playerCar();
+  if (!car) return { x: 0, y: 0 };
+  const want = Math.atan2(ty - car.y, tx - car.x);
+  const diff = angleDiff(want, car.angle);
+  return { x: clamp(diff * 2.4, -1, 1), y: -1 };
+}
+
+// Walk the player toward a point.
+function walkToward(game, tx, ty) {
+  const p = game.state.player;
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const len = Math.hypot(dx, dy) || 1;
+  return { x: dx / len, y: dy / len };
+}
+
+function putPlayerInCar(game, car, x, y, angle) {
+  car.x = x;
+  car.y = y;
+  car.angle = angle;
+  car.speed = 0;
+  car.driver = 'player';
+  game.state.player.inCar = car.id;
+  game.state.player.inBoat = false;
+  game.state.player.inHeli = false;
+}
+
+function runSeconds(game, seconds, inputFn) {
+  for (let i = 0; i < seconds / STEP; i += 1) {
+    game.step(STEP, inputFn ? inputFn() : {}, {});
   }
-  const limit = name === 'end' ? END_LIMIT_SECONDS : PLAY_SECONDS;
-  const horizon = name === 'end' ? HORIZON_END : HORIZON_PLAY;
-  for (let index = 0; index < limit / STEP; index += 1) {
-    if (world.step(STEP, autopilot(world.state, horizon), false) & EVENT_OVER) break;
+}
+
+export function stageShot(name, game) {
+  const s = game.state;
+  const dbg = game.debug;
+  const sports = game.state.cars.find((c) => c.missionCar === 'solmar-crown');
+  const sedan = game.state.cars.find((c) => c.type === 'sedan' && !c.missionCar);
+
+  if (name === 'cover') {
+    // Golden dusk, three stars, heli overhead, cruisers closing in, and a
+    // mission objective on the tracker: the crown job's getaway.
+    dbg.setDay(0.62);
+    dbg.setMission(0);
+    s.missionStep = 2;
+    putPlayerInCar(game, sports, 1103, 1103, 0.1);
+    sports.speed = 300;
+    dbg.setWanted(3);
+    dbg.forceHeli();
+    const c1 = dbg.spawnCar('cruiser', 880, 1000);
+    c1.driver = 'police';
+    const c2 = dbg.spawnCar('cruiser', 920, 1200);
+    c2.driver = 'police';
+    runSeconds(game, 1.2, () => driveToward(game, 2200, 1103));
+    // Pin the final frame: the getaway car at speed, the helicopter clearly
+    // in frame up and to the right of it, a cruiser closing in behind.
+    const pc = game.playerCar();
+    if (pc) pc.speed = 380;
+    s.heli.x = (pc ? pc.x : 1300) + 190;
+    s.heli.y = (pc ? pc.y : 1100) - 150;
+    return { screen: SCREEN_PLAY };
   }
-  const over = world.state.lives === 0;
-  return { screen: over ? SCREEN_OVER : SCREEN_PLAY, best: world.state.score };
+
+  if (name === 'drive') {
+    // Bright late morning on the main avenue, in a stolen sedan, traffic
+    // flowing around and the first job waiting on the tracker.
+    dbg.setDay(0.45);
+    dbg.setMission(0);
+    putPlayerInCar(game, sedan, 671, 671, 0);
+    sedan.speed = 260;
+    runSeconds(game, 5, () => driveToward(game, 2000, 671));
+    if (sedan.speed < 60) sedan.speed = 260;
+    return { screen: SCREEN_PLAY };
+  }
+
+  if (name === 'mission') {
+    // On foot at the fish market, second job: the crate is waiting and the
+    // gold marker is right there.
+    dbg.setDay(0.35);
+    dbg.setMission(1);
+    const market = game.city.pois['fish-market'];
+    dbg.teleport(market.x - 200, market.y + 100);
+    s.player.angle = Math.atan2(market.y - s.player.y, market.x - s.player.x);
+    runSeconds(game, 0.3, () => walkToward(game, market.x, market.y));
+    return { screen: SCREEN_PLAY };
+  }
+
+  // chase: five stars at night, the whole department after Rico.
+  dbg.setDay(0.88);
+  dbg.setMission(9);
+  putPlayerInCar(game, sports, 1319, 1319, -Math.PI / 2);
+  sports.speed = 380;
+  dbg.setWanted(5);
+  dbg.forceHeli();
+  for (const [x, y] of [[1100, 1150], [1500, 1200], [1250, 1550], [1450, 1050]]) {
+    const c = dbg.spawnCar('cruiser', x, y);
+    c.driver = 'police';
+  }
+  runSeconds(game, 2.5, () => driveToward(game, 1319, 200));
+  // Pin the final frame: the sports car fleeing north at speed, the
+  // helicopter in frame above it, cruisers closing in from behind.
+  const pc = game.playerCar();
+  if (pc) pc.speed = 420;
+  s.heli.x = (pc ? pc.x : 1300) + 150;
+  s.heli.y = (pc ? pc.y : 800) - 180;
+  return { screen: SCREEN_PLAY };
 }
